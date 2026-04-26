@@ -167,12 +167,30 @@
             white-space: nowrap;
         }
 
+        /* 雲端同步狀態 */
+        .sync-status {
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-bottom: 14px;
+            font-size: 0.82rem;
+            line-height: 1.55;
+            word-break: break-all;
+            white-space: pre-line;
+            background: #f0f7ff;
+            border: 1px solid #cfe3f5;
+            color: var(--deep-ocean);
+        }
+        .sync-status.success { background: #f0fff4; border-color: #c8e6c9; color: #2e7d32; }
+        .sync-status.error { background: #fff4f0; border-color: #ffd0c0; color: #c4501c; }
+        .sync-status.modified { background: #fff8e7; border-color: #ffe0a0; color: #8b5a00; }
+
         /* 備份列 */
         .backup-bar {
             display: flex;
-            gap: 8px;
+            gap: 6px;
             margin-bottom: 14px;
             justify-content: flex-end;
+            flex-wrap: wrap;
         }
         .backup-btn {
             background: #f0f7ff;
@@ -183,6 +201,8 @@
             border: 1px solid #cfe3f5;
         }
         .backup-btn:hover { background: #e0f0fc; }
+        .backup-btn.primary { background: var(--med-blue); color: white; border-color: var(--med-blue); }
+        .backup-btn.primary:hover { background: var(--deep-ocean); }
 
         /* 篩選列 */
         .filter-bar {
@@ -523,8 +543,9 @@
                 order: 3;
             }
 
-            .backup-bar { justify-content: space-between; }
-            .backup-btn { flex: 1; padding: 10px 8px; font-size: 0.8rem; }
+            .sync-status { font-size: 0.78rem; padding: 8px 10px; }
+            .backup-bar { justify-content: space-between; gap: 4px; }
+            .backup-btn { flex: 1 1 calc(50% - 4px); padding: 10px 6px; font-size: 0.78rem; }
             .filter-btn { padding: 8px 14px; font-size: 0.85rem; }
 
             /* 清單項目 */
@@ -603,8 +624,12 @@
         <div class="progress-hint" id="progress-hint">繼續加油 🌊</div>
     </div>
 
+    <div id="sync-status" class="sync-status" style="display:none;"></div>
+
     <div class="backup-bar">
-        <button class="backup-btn" id="export-btn" title="匯出資料為 JSON 檔">📤 匯出備份</button>
+        <button class="backup-btn primary" id="sync-reload-btn" title="從雲端 JSON 重新載入">🔄 雲端載入</button>
+        <button class="backup-btn" id="sync-setup-btn" title="設定 Google Drive 公開連結">🔗 設定雲端</button>
+        <button class="backup-btn" id="export-btn" title="匯出資料為 JSON 檔（覆蓋雲端）">📤 匯出備份</button>
         <button class="backup-btn" id="import-btn" title="從 JSON 檔還原資料">📥 匯入備份</button>
         <input type="file" id="import-input" accept="application/json,.json" style="display:none;">
     </div>
@@ -679,6 +704,14 @@ const filterBtns = document.querySelectorAll('.filter-btn');
 const exportBtn = document.getElementById('export-btn');
 const importBtn = document.getElementById('import-btn');
 const importInput = document.getElementById('import-input');
+const syncStatusEl = document.getElementById('sync-status');
+const syncReloadBtn = document.getElementById('sync-reload-btn');
+const syncSetupBtn = document.getElementById('sync-setup-btn');
+
+const SYNC_URL_KEY = 'lifeList.syncUrl';
+const LAST_SYNC_KEY = 'lifeList.lastSyncAt';
+const LAST_EDIT_KEY = 'lifeList.lastEditAt';
+let cloudExportedAt = null;
 
 const modalBg = document.getElementById('modal-bg');
 const modalTarget = document.getElementById('modal-target');
@@ -766,6 +799,8 @@ function compressImage(file) {
 function save() {
     try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+        localStorage.setItem(LAST_EDIT_KEY, new Date().toISOString());
+        refreshSyncStatus();
     } catch (e) {
         console.warn('儲存失敗', e);
         alert('儲存空間可能不足，請刪除一些照片再試。');
@@ -1170,6 +1205,16 @@ exportBtn.addEventListener('click', () => {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+
+    if (localStorage.getItem(SYNC_URL_KEY)) {
+        showSync(
+            `📤 已下載備份檔，請執行：\n` +
+            `1. 開啟 Google Drive，找到舊的 JSON 檔\n` +
+            `2. 右鍵 →「管理版本」→ 上傳這個新檔（保留同個檔案 ID）\n` +
+            `3. 在另一台裝置按「🔄 雲端載入」即可同步`,
+            'modified'
+        );
+    }
 });
 
 importBtn.addEventListener('click', () => importInput.click());
@@ -1221,9 +1266,138 @@ importInput.addEventListener('change', (e) => {
     reader.readAsText(file);
 });
 
+// ===== 雲端同步（Google Drive 公開連結） =====
+function extractDriveFileId(url) {
+    if (!url) return null;
+    const s = url.trim();
+    let m = s.match(/\/file\/d\/([^/?#]+)/);
+    if (m) return m[1];
+    m = s.match(/[?&]id=([^&]+)/);
+    if (m) return m[1];
+    if (/^[\w-]{20,}$/.test(s)) return s; // 直接貼 file ID
+    return null;
+}
+
+function showSync(text, type) {
+    syncStatusEl.style.display = 'block';
+    syncStatusEl.className = 'sync-status' + (type ? ' ' + type : '');
+    syncStatusEl.textContent = text;
+}
+
+function refreshSyncStatus() {
+    const lastEdit = localStorage.getItem(LAST_EDIT_KEY);
+    if (cloudExportedAt && lastEdit && new Date(lastEdit) > new Date(cloudExportedAt)) {
+        showSync(
+            `⚠️ 本地有未同步的修改（${fmtDateTime(lastEdit)}）\n` +
+            `請按「📤 匯出備份」並上傳到 Google Drive 覆蓋舊檔。\n` +
+            `雲端版本：${fmtDateTime(cloudExportedAt)}`,
+            'modified'
+        );
+    }
+}
+
+async function loadFromCloud(opts) {
+    opts = opts || {};
+    let syncUrl = localStorage.getItem(SYNC_URL_KEY);
+    if (!syncUrl) {
+        if (opts.silent) return false;
+        showSync('尚未設定雲端同步連結，請按「🔗 設定雲端」', '');
+        return false;
+    }
+    const fileId = extractDriveFileId(syncUrl);
+    if (!fileId) {
+        showSync('⚠️ 無法解析雲端連結（請確認是 Google Drive 分享 URL）', 'error');
+        return false;
+    }
+    showSync('⏳ 正在從雲端載入...', '');
+    const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    try {
+        const res = await fetch(downloadUrl, { mode: 'cors', cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const text = await res.text();
+        if (text.trim().startsWith('<')) {
+            throw new Error('收到 HTML 而非 JSON。請確認檔案已設為「知道連結的所有人皆可檢視」');
+        }
+        const data = JSON.parse(text);
+        const incoming = Array.isArray(data) ? data : (data.items || []);
+        if (!Array.isArray(incoming)) throw new Error('JSON 結構錯誤（找不到 items 陣列）');
+
+        items = incoming;
+        items.forEach(it => {
+            if (it.photos === undefined) it.photos = [];
+            if (it.journey === undefined) it.journey = '';
+            if (it.done === undefined) it.done = false;
+            if (it.doneAt === undefined) it.doneAt = null;
+            if (!it.id) it.id = uid();
+            if (!it.createdAt) it.createdAt = new Date().toISOString();
+        });
+
+        cloudExportedAt = data.exportedAt || null;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+        localStorage.setItem(LAST_SYNC_KEY, new Date().toISOString());
+        // 把本地編輯時間設成雲端的時間，避免立刻就顯示「未同步」
+        if (cloudExportedAt) localStorage.setItem(LAST_EDIT_KEY, cloudExportedAt);
+
+        render();
+        const ts = cloudExportedAt ? fmtDateTime(cloudExportedAt) : '未知';
+        const doneCnt = items.filter(x => x.done).length;
+        showSync(
+            `✅ 已從雲端載入｜備份時間：${ts}\n` +
+            `共 ${items.length} 筆（已完成 ${doneCnt} 筆）— 確認無誤後即可繼續編輯。`,
+            'success'
+        );
+        return true;
+    } catch (err) {
+        console.warn(err);
+        showSync(
+            `⚠️ 雲端載入失敗：${err.message}\n` +
+            `可能原因：檔案非公開、連結錯誤、或 Google Drive 阻擋了 CORS 跨網域存取。\n` +
+            `→ 請改用「📥 匯入備份」手動載入 Drive 下載的 JSON 檔。`,
+            'error'
+        );
+        return false;
+    }
+}
+
+syncReloadBtn.addEventListener('click', () => loadFromCloud());
+
+syncSetupBtn.addEventListener('click', () => {
+    const cur = localStorage.getItem(SYNC_URL_KEY) || '';
+    const url = window.prompt(
+        '請貼上 Google Drive 檔案的分享連結\n\n' +
+        '步驟：\n' +
+        '1. 在 Drive 對 JSON 檔點右鍵 →「共用」\n' +
+        '2. 「一般存取權」改為「知道連結的所有人」→ 檢視者\n' +
+        '3. 複製連結貼到下面：',
+        cur
+    );
+    if (url === null) return;
+    if (url.trim() === '') {
+        localStorage.removeItem(SYNC_URL_KEY);
+        showSync('已清除雲端連結設定', '');
+        return;
+    }
+    const fid = extractDriveFileId(url);
+    if (!fid) {
+        alert('⚠️ 無法解析這個連結，請確認是 Google Drive 分享 URL');
+        return;
+    }
+    localStorage.setItem(SYNC_URL_KEY, url.trim());
+    loadFromCloud();
+});
+
 // ===== 啟動 =====
 load();
 render();
+// 啟動時若已設定同步連結，自動嘗試從雲端載入
+if (localStorage.getItem(SYNC_URL_KEY)) {
+    loadFromCloud({ silent: false });
+} else if (items.length > 0) {
+    const lastEdit = localStorage.getItem(LAST_EDIT_KEY);
+    if (lastEdit) {
+        showSync(`💾 使用本地資料｜最近編輯：${fmtDateTime(lastEdit)}\n（按「🔗 設定雲端」啟用手機+電腦同步）`, '');
+    }
+}
 </script>
 
 </body>
